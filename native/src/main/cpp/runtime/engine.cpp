@@ -7,6 +7,7 @@
 #include "crypto/apk_sign.h"
 #include "crypto/key_ladder.h"
 #include "crypto/dex_asset.h"
+#include "crypto/section_decrypt.h"
 #include "dex/dex_file.h"
 #include "hook/hooks.h"
 #include "risk/risk.h"
@@ -739,6 +740,8 @@ void on_load(JavaVM* vm) {
     if (runtime_state().sdk_level == 0) {
         runtime_state().sdk_level = android_get_device_api_level();
     }
+    // Linker lock released — safe to install bytehook / Dobby linker hooks.
+    protector::init_protector();
     PLOGI("protector native on_load, sdk=%d", runtime_state().sdk_level);
 }
 
@@ -1038,7 +1041,7 @@ jstring read_application_name(JNIEnv* env, jclass) {
 }
 
 jstring native_version(JNIEnv* env, jclass) {
-    return env->NewStringUTF("protector-native/0.7.2");
+    return env->NewStringUTF("protector-native/0.7.3");
 }
 
 jboolean environment_degraded(JNIEnv*, jclass) {

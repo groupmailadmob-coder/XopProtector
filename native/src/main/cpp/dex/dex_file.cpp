@@ -1,5 +1,6 @@
 #include "dex/dex_file.h"
 #include "common/log.h"
+#include "common/va_tag.h"
 #include "common/runtime_state.h"
 #include "common/protector_macro.h"
 #include "crypto/insn_crypt.h"
@@ -96,7 +97,7 @@ size_t read_methods(const uint8_t* data, size_t max_len, ClassDataMethod* out,
 }
 
 static bool ptr_userspace_plausible(const void* p) {
-    auto u = reinterpret_cast<uintptr_t>(p);
+    auto u = strip_va_tag(reinterpret_cast<uintptr_t>(p));
     if (u < 0x1000u) return false;
 #ifdef __LP64__
     if (u > 0x00007FFFFFFFFFFFULL) return false;
@@ -107,18 +108,19 @@ static bool ptr_userspace_plausible(const void* p) {
 /** Read without SIGSEGV. process_vm_readv first; ENOSYS/EPERM falls back to memcpy. */
 static bool safe_read(const void* addr, void* out, size_t n) {
     if (out == nullptr || n == 0) return false;
-    if (!ptr_userspace_plausible(addr)) return false;
-    auto end = reinterpret_cast<uintptr_t>(addr) + (n - 1);
+    const void* p = untag_ptr(addr);
+    if (!ptr_userspace_plausible(p)) return false;
+    auto end = reinterpret_cast<uintptr_t>(p) + (n - 1);
     if (!ptr_userspace_plausible(reinterpret_cast<const void*>(end))) return false;
 
     static int vm_readv_state = 0; // 0 unknown, 1 ok, -1 memcpy fallback
     if (vm_readv_state < 0) {
-        memcpy(out, addr, n);
+        memcpy(out, p, n);
         return true;
     }
 
     iovec local{out, n};
-    iovec remote{const_cast<void*>(addr), n};
+    iovec remote{const_cast<void*>(p), n};
     ssize_t got = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
     if (got == static_cast<ssize_t>(n)) {
         vm_readv_state = 1;
@@ -129,7 +131,7 @@ static bool safe_read(const void* addr, void* out, size_t n) {
     if (got < 0 && (errno == ENOSYS || errno == EPERM || errno == EACCES
                     || errno == EINVAL)) {
         vm_readv_state = -1;
-        memcpy(out, addr, n);
+        memcpy(out, p, n);
         return true;
     }
     return false;

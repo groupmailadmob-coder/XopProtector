@@ -7,6 +7,7 @@ import com.wind.meditor.property.AttributeItem;
 import com.wind.meditor.property.ModificationProperty;
 import com.wind.meditor.utils.NodeValue;
 
+import com.yqsh.protector.packer.elf.ReadElf;
 import com.yqsh.protector.packer.util.CryptoUtils;
 
 import net.lingala.zip4j.ZipFile;
@@ -59,6 +60,8 @@ public class PackerMain {
     private static final String PROXY_ACF = "com.yqsh.protector.shell.ProxyComponentFactory";
 
     private static final String HMAC_KEY_SPEC = "HmacSHA256";
+    /** Google Play 16 KB page-size check: 64-bit PT_LOAD p_align must be at least this. */
+    private static final long LIBCXX_16K_ALIGN = 16L * 1024L;
 
     /**
      * Optional allowlist of type-descriptor prefixes ({@code --hollow-prefix}).
@@ -963,7 +966,20 @@ public class PackerMain {
                 boolean hasProtector = false;
                 for (File so : sos) {
                     File dest = new File(dstAbi, so.getName());
+                    // Keep the input APK's libc++_shared when present. Shell NDK
+                    // builds are often older and lack symbols required by newer
+                    // business SOs (e.g. __cxa_init_primary_exception →
+                    // libdjisdk_jni.so UnsatisfiedLinkError after protect).
+                    if ("libc++_shared.so".equals(so.getName()) && dest.isFile()) {
+                        warnKeptLibcxxAlign(abi, dest);
+                        System.out.println("Keep input " + abi
+                                + "/libc++_shared.so (shell would overwrite ABI)");
+                        continue;
+                    }
                     Files.copy(so.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    if ("libc++_shared.so".equals(so.getName())) {
+                        requireShellLibcxx16k(abi, dest);
+                    }
                     if ("libprotector.so".equals(so.getName()) && kWrap != null) {
                         String hmacHex = SoSectionEncryptor.encrypt(dest, kWrap, kMaster, kHmac);
                         bitcodeHmac.put(abi, hmacHex);
@@ -989,6 +1005,52 @@ public class PackerMain {
             throw new IllegalStateException("no libprotector.so embedded — cannot HMAC .bitcode");
         }
         return bitcodeHmac;
+    }
+
+    private static boolean is64BitAbi(String abi) {
+        return "arm64-v8a".equals(abi) || "x86_64".equals(abi);
+    }
+
+    /**
+     * Shell-injected {@code libc++_shared.so} on 64-bit ABIs must already be
+     * 16 KB aligned. A 4 KB copy fails Play's page-size check.
+     */
+    private static void requireShellLibcxx16k(String abi, File so) throws IOException {
+        if (!is64BitAbi(abi)) {
+            return;
+        }
+        long align = ReadElf.minLoadAlign(so);
+        if (align < LIBCXX_16K_ALIGN) {
+            throw new IllegalStateException(
+                    "shell " + abi + "/libc++_shared.so PT_LOAD align 0x"
+                            + Long.toHexString(align)
+                            + " is below 16KB. Re-run exportShellFiles with NDK r27+.");
+        }
+    }
+
+    /**
+     * The input APK's own {@code libc++_shared.so} is kept. Warn when that
+     * 64-bit file is still 4 KB aligned so the failure is not blamed on the shell.
+     */
+    private static void warnKeptLibcxxAlign(String abi, File so) {
+        if (!is64BitAbi(abi)) {
+            return;
+        }
+        final long align;
+        try {
+            align = ReadElf.minLoadAlign(so);
+        } catch (Exception ex) {
+            System.out.println("WARN: keeping input " + abi
+                    + "/libc++_shared.so but could not read PT_LOAD align: "
+                    + ex.getMessage());
+            return;
+        }
+        if (align < LIBCXX_16K_ALIGN) {
+            System.out.println("WARN: keeping input " + abi
+                    + "/libc++_shared.so PT_LOAD align 0x" + Long.toHexString(align)
+                    + " (< 16KB). Play's 16KB page check will fail;"
+                    + " the shell does not replace this file.");
+        }
     }
 
     /** Compact JSON object for {@code bitcode_hmac}; keys sorted (TreeMap). */
@@ -1946,6 +2008,11 @@ public class PackerMain {
         cmd.add("true");
         cmd.add("--v2-signing-enabled");
         cmd.add("true");
+        // v4 writes a sibling .apk.idsig. adb install then tries incremental
+        // install and fails to parse the Windows path (drive-letter ':'), printing
+        // "Unable to parse file parameters" before falling back to streamed install.
+        cmd.add("--v4-signing-enabled");
+        cmd.add("false");
         cmd.add(input.getAbsolutePath());
         ApkSignerTool.main(cmd.toArray(new String[0]));
     }

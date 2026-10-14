@@ -161,6 +161,149 @@ tasks.register("exportShellFiles") {
             Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
             println("Exported ${abiDir.name}/libshadowhook.so (from ${src.absolutePath})")
         }
+
+        // libprotector.so is linked 16KB-aligned; the NDK's prebuilt libc++_shared.so
+        // is not. Swap in the newest NDK r27+ copy for 64-bit ABIs only.
+        replaceLibcxxShared16k(sdkDir, libsOut)
+    }
+}
+
+/** 64-bit ABIs whose packaged libc++ must have PT_LOAD p_align >= 16KB. */
+val libcxx16kAbis = mapOf(
+    "arm64-v8a" to "aarch64-linux-android",
+    "x86_64" to "x86_64-linux-android",
+)
+
+fun replaceLibcxxShared16k(sdkDir: String, libsOut: File) {
+    val ndk = findNdk27Plus(sdkDir)
+    val host = llvmPrebuiltHost(ndk)
+    val sysrootLib = File(host, "sysroot/usr/lib")
+    println("16KB libc++_shared.so from NDK ${ndk.name} (${host.name})")
+    for ((abi, triple) in libcxx16kAbis) {
+        val destDir = File(libsOut, abi)
+        if (!destDir.isDirectory) continue
+        val src = File(sysrootLib, "$triple/libc++_shared.so")
+        if (!src.isFile) {
+            throw GradleException("NDK ${ndk.name} has no $src")
+        }
+        val dest = File(destDir, "libc++_shared.so")
+        Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        val align = minElfLoadAlign(dest)
+        if (align < 16384L) {
+            throw GradleException(
+                "${dest.absolutePath} PT_LOAD align 0x${align.toString(16)} is below 16KB"
+            )
+        }
+        println("Replaced $abi/libc++_shared.so align=0x${align.toString(16)} (${dest.length()} bytes)")
+    }
+}
+
+fun findNdk27Plus(sdkDir: String): File {
+    val ndkRoot = File(sdkDir, "ndk")
+    if (!ndkRoot.isDirectory) {
+        throw GradleException("NDK r27+ required for 16KB libc++_shared.so, but $ndkRoot does not exist")
+    }
+    val picked = ndkRoot.listFiles()?.filter { it.isDirectory && ndkMajor(it.name) >= 27 }
+        ?.maxWithOrNull(compareBy<File> { ndkMajor(it.name) }
+            .thenBy { ndkPart(it.name, 1) }
+            .thenBy { ndkPart(it.name, 2) })
+    if (picked == null) {
+        throw GradleException(
+            "NDK r27+ required for 16KB libc++_shared.so. Install one under $ndkRoot"
+        )
+    }
+    return picked
+}
+
+fun ndkMajor(name: String): Int = ndkPart(name, 0)
+
+fun ndkPart(name: String, index: Int): Int {
+    val parts = name.split('.', '-', '_')
+    if (index >= parts.size) return 0
+    return parts[index].toIntOrNull() ?: 0
+}
+
+fun llvmPrebuiltHost(ndk: File): File {
+    val root = File(ndk, "toolchains/llvm/prebuilt")
+    val os = System.getProperty("os.name").lowercase()
+    val prefix = when {
+        os.contains("windows") -> "windows-"
+        os.contains("mac") -> "darwin-"
+        else -> "linux-"
+    }
+    val dirs = root.listFiles()?.filter { it.isDirectory && it.name.startsWith(prefix) }.orEmpty()
+    if (dirs.isEmpty()) {
+        throw GradleException("No LLVM prebuilt for $prefix under $root")
+    }
+    val arch = System.getProperty("os.arch").lowercase()
+    val archToken = if (arch.contains("aarch64") || arch == "arm64") "arm64" else "x86_64"
+    return dirs.firstOrNull { it.name.contains(archToken) } ?: dirs.first()
+}
+
+/** Smallest ELF64 PT_LOAD p_align. Used to reject a 4KB libc++_shared.so. */
+fun minElfLoadAlign(so: File): Long {
+    java.io.RandomAccessFile(so, "r").use { raf ->
+        val ident = ByteArray(16)
+        raf.readFully(ident)
+        if (ident[0] != 0x7f.toByte() || ident[1] != 'E'.code.toByte() ||
+            ident[2] != 'L'.code.toByte() || ident[3] != 'F'.code.toByte()
+        ) {
+            throw GradleException("not an ELF: $so")
+        }
+        if (ident[4].toInt() != 2) {
+            throw GradleException("expected ELF64: $so")
+        }
+        if (ident[5].toInt() != 1) {
+            throw GradleException("expected little-endian ELF: $so")
+        }
+        fun u16(): Int {
+            val b = ByteArray(2)
+            raf.readFully(b)
+            return (b[0].toInt() and 0xff) or ((b[1].toInt() and 0xff) shl 8)
+        }
+        fun u32(): Long {
+            val b = ByteArray(4)
+            raf.readFully(b)
+            return (b[0].toLong() and 0xff) or
+                ((b[1].toLong() and 0xff) shl 8) or
+                ((b[2].toLong() and 0xff) shl 16) or
+                ((b[3].toLong() and 0xff) shl 24)
+        }
+        fun u64(): Long {
+            val lo = u32()
+            val hi = u32()
+            return lo or (hi shl 32)
+        }
+        u16() // e_type
+        u16() // e_machine
+        u32() // e_version
+        u64() // e_entry
+        val phOff = u64()
+        u64() // e_shoff
+        u32() // e_flags
+        u16() // e_ehsize
+        val phEntSize = u16()
+        val phNum = u16()
+        var min = Long.MAX_VALUE
+        var saw = false
+        for (i in 0 until phNum) {
+            raf.seek(phOff + i.toLong() * phEntSize)
+            val pType = u32()
+            if (pType != 1L) continue
+            u32() // p_flags
+            u64() // p_offset
+            u64() // p_vaddr
+            u64() // p_paddr
+            u64() // p_filesz
+            u64() // p_memsz
+            val align = u64()
+            if (align < min) min = align
+            saw = true
+        }
+        if (!saw) {
+            throw GradleException("no PT_LOAD in $so")
+        }
+        return min
     }
 }
 

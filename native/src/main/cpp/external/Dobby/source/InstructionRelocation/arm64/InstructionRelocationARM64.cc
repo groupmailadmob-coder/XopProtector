@@ -146,6 +146,61 @@ static inline bool inst_is_test_b(uint32_t instr) {
   return (instr & TestBranchFixedMask) == TestBranchFixed;
 }
 
+struct LocalBranchFix {
+  uint32_t b_off;
+  uint32_t target_off;
+};
+
+static bool dst_in_origin_window(relo_ctx_t *ctx, addr_t dst, uint32_t *off) {
+  if (dst < ctx->src_vmaddr)
+    return false;
+  addr_t rel = dst - ctx->src_vmaddr;
+  if (rel >= ctx->buffer_size || (rel & 3) != 0)
+    return false;
+  *off = (uint32_t)rel;
+  return true;
+}
+
+// Bytes emitted by emit_taken_sequence for this target.
+static int taken_sequence_bytes(relo_ctx_t *ctx, addr_t dst, int nfixes) {
+  uint32_t off = 0;
+  if (dst_in_origin_window(ctx, dst, &off) && nfixes < 32)
+    return 4;
+  uint32_t replay = 0;
+  if (arm64_make_bti_landing(dst, &replay))
+    return (replay != 0 ? 4 : 0) + 8;
+  return 8;
+}
+
+// Branch to dst. Targets inside the patched prologue go to the relocated
+// copy — the original bytes are the hook trampoline. Other targets get a
+// BTI landing pad so the indirect branch is legal on Android 14+.
+static void emit_taken_sequence(relo_ctx_t *ctx, TurboAssembler &as, LocalBranchFix *fixes, int *nfixes,
+                                addr_t dst, bool is_call) {
+  uint32_t target_off = 0;
+  if (dst_in_origin_window(ctx, dst, &target_off) && *nfixes < 32) {
+    uint32_t b_off = (uint32_t)as.GetCodeBuffer()->GetBufferSize();
+    as.Emit(is_call ? 0x94000000u : 0x14000000u);
+    fixes[(*nfixes)++] = LocalBranchFix{b_off, target_off};
+    return;
+  }
+  uint32_t replay = 0;
+  addr_t land = dst;
+  if (!arm64_make_bti_landing(dst, &replay)) {
+    land = arm64_bti_direct_landing(dst);
+    replay = 0;
+  }
+  if (replay != 0)
+    as.Emit(replay);
+  RelocLabel *dst_label = new RelocLabel(land);
+  as.AppendRelocLabel(dst_label);
+  as.Ldr(TMP_REG_0, dst_label);
+  if (is_call)
+    as.blr(TMP_REG_0);
+  else
+    as.br(TMP_REG_0);
+}
+
 // ---
 
 int relo_relocate(relo_ctx_t *ctx, bool branch) {
@@ -155,6 +210,8 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
 #define _ turbo_assembler_.
 
   auto relocated_buffer = turbo_assembler_.GetCodeBuffer();
+  LocalBranchFix fixes[32];
+  int nfixes = 0;
 
   while (ctx->buffer_cursor < ctx->buffer + ctx->buffer_size) {
     uint32_t orig_off = ctx->buffer_cursor - ctx->buffer;
@@ -176,18 +233,8 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
 
       int64_t offset = decode_imm26_offset(inst);
       addr_t dst_vmaddr = relo_cur_src_vmaddr(ctx) + offset;
-
-      RelocLabel *dst_label = new RelocLabel(dst_vmaddr);
-      _ AppendRelocLabel(dst_label);
-
-      {
-        _ Ldr(TMP_REG_0, dst_label);
-        if ((inst & UnconditionalBranchMask) == BL) {
-          _ blr(TMP_REG_0);
-        } else {
-          _ br(TMP_REG_0);
-        }
-      }
+      bool is_call = (inst & UnconditionalBranchMask) == BL;
+      emit_taken_sequence(ctx, turbo_assembler_, fixes, &nfixes, dst_vmaddr, is_call);
 
     } else if (inst_is_ldr_literal(inst)) {
       DLOG(0, "%d:relo <ldr_literal> at %p", relocated_insn_count++, relo_cur_src_vmaddr(ctx));
@@ -245,21 +292,13 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
         cond = cond ^ 1;
         set_bits(branch_instr, 0, 3, cond);
 
-        int64_t offset = 4 * 3;
-        uint32_t imm19 = offset >> 2;
+        int64_t skip = 4 + taken_sequence_bytes(ctx, dst_vmaddr, nfixes);
+        uint32_t imm19 = (uint32_t)skip >> 2;
         set_bits(branch_instr, 5, 23, imm19);
       }
 
-      RelocLabel *dst_label = new RelocLabel(dst_vmaddr);
-      _ AppendRelocLabel(dst_label);
-
-      {
-        _ Emit(branch_instr);
-        {
-          _ Ldr(TMP_REG_0, dst_label);
-          _ br(TMP_REG_0);
-        }
-      }
+      _ Emit(branch_instr);
+      emit_taken_sequence(ctx, turbo_assembler_, fixes, &nfixes, dst_vmaddr, false);
     } else if (inst_is_compare_b(inst)) {
       DLOG(0, "%d:relo <compare_b> at %p", relocated_insn_count++, relo_cur_src_vmaddr(ctx));
 
@@ -272,21 +311,13 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
         op = op ^ 1;
         set_bit(branch_instr, 24, op);
 
-        int64_t offset = 4 * 3;
-        uint32_t imm19 = offset >> 2;
+        int64_t skip = 4 + taken_sequence_bytes(ctx, dst_vmaddr, nfixes);
+        uint32_t imm19 = (uint32_t)skip >> 2;
         set_bits(branch_instr, 5, 23, imm19);
       }
 
-      RelocLabel *dst_label = new RelocLabel(dst_vmaddr);
-      _ AppendRelocLabel(dst_label);
-
-      {
-        _ Emit(branch_instr);
-        {
-          _ Ldr(TMP_REG_0, dst_label);
-          _ br(TMP_REG_0);
-        }
-      }
+      _ Emit(branch_instr);
+      emit_taken_sequence(ctx, turbo_assembler_, fixes, &nfixes, dst_vmaddr, false);
     } else if (inst_is_test_b(inst)) {
       DLOG(0, "%d:relo <test_b> at %p", relocated_insn_count++, relo_cur_src_vmaddr(ctx));
 
@@ -299,21 +330,13 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
         op = op ^ 1;
         set_bit(branch_instr, 24, op);
 
-        int64_t offset = 4 * 3;
-        uint32_t imm14 = offset >> 2;
+        int64_t skip = 4 + taken_sequence_bytes(ctx, dst_vmaddr, nfixes);
+        uint32_t imm14 = (uint32_t)skip >> 2;
         set_bits(branch_instr, 5, 18, imm14);
       }
 
-      RelocLabel *dst_label = new RelocLabel(dst_vmaddr);
-      _ AppendRelocLabel(dst_label);
-
-      {
-        _ Emit(branch_instr);
-        {
-          _ Ldr(TMP_REG_0, dst_label);
-          _ br(TMP_REG_0);
-        }
-      }
+      _ Emit(branch_instr);
+      emit_taken_sequence(ctx, turbo_assembler_, fixes, &nfixes, dst_vmaddr, false);
     } else {
       _ Emit(inst);
     }
@@ -330,6 +353,14 @@ int relo_relocate(relo_ctx_t *ctx, bool branch) {
   if (branch) {
     CodeGen codegen(&turbo_assembler_);
     codegen.LiteralLdrBranch(ctx->origin->addr + ctx->origin->size);
+  }
+
+  for (int i = 0; i < nfixes; i++) {
+    off_t dest = ctx->relocated_offset_map[(off_t)fixes[i].target_off];
+    int64_t distance = (int64_t)dest - (int64_t)fixes[i].b_off;
+    uint32_t old = (uint32_t)relocated_buffer->LoadInst(fixes[i].b_off);
+    uint32_t insn = (old & 0xFC000000u) | ((uint32_t)(distance >> 2) & 0x03ffffffu);
+    relocated_buffer->RewriteInst(fixes[i].b_off, (arm64_inst_t)insn);
   }
 
   // Bind all labels

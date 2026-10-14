@@ -188,6 +188,8 @@ public class ReadElf implements AutoCloseable {
     /** Dynamic Symbol Table symbol names */
     private Map<String, Symbol> mDynamicSymbols;
     private List<SectionHeader> mSectionHeaderList;
+    /** Smallest {@code PT_LOAD} {@code p_align}, or 0 when the file has no LOAD segment. */
+    private long mMinLoadAlign;
 
     public static ReadElf read(File file) throws IOException {
         return new ReadElf(file);
@@ -201,6 +203,17 @@ public class ReadElf implements AutoCloseable {
     }
     public boolean isPIE() {
         return mIsPIE;
+    }
+
+    /** Smallest {@code PT_LOAD} {@code p_align}, or 0 when the file has no LOAD segment. */
+    public long minLoadAlign() {
+        return mMinLoadAlign;
+    }
+
+    public static long minLoadAlign(File file) throws IOException {
+        try (ReadElf elf = read(file)) {
+            return elf.minLoadAlign();
+        }
     }
     public ReadElf(File file) throws IOException {
         mPath = file.getPath();
@@ -336,22 +349,43 @@ public class ReadElf implements AutoCloseable {
     }
 
     private void readProgramHeaders(long ph_off, int e_phnum, int e_phentsize) throws IOException {
+        long minAlign = Long.MAX_VALUE;
+        boolean sawLoad = false;
         for (int i = 0; i < e_phnum; ++i) {
             mFile.seek(ph_off + i * e_phentsize);
             long p_type = readWord();
             if (p_type == PT_LOAD) {
+                long p_vaddr;
+                long p_align;
                 if (mAddrSize == 8) {
-                    // Only in Elf64_phdr; in Elf32_phdr p_flags is at the end.
-                    long p_flags = readWord();
+                    // Elf64_Phdr: p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align.
+                    readWord();
+                    readOff();
+                    p_vaddr = readAddr();
+                    readAddr();
+                    readX(8);
+                    readX(8);
+                    p_align = readX(8);
+                } else {
+                    // Elf32_Phdr: p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align.
+                    readOff();
+                    p_vaddr = readAddr();
+                    readAddr();
+                    readWord();
+                    readWord();
+                    readWord();
+                    p_align = readWord();
                 }
-                long p_offset = readOff();
-                long p_vaddr = readAddr();
-                // ...
                 if (p_vaddr == 0) {
                     mIsPIE = true;
                 }
+                if (p_align < minAlign) {
+                    minAlign = p_align;
+                }
+                sawLoad = true;
             }
         }
+        mMinLoadAlign = sawLoad ? minAlign : 0;
     }
 
     private HashMap<String, Symbol> readSymbolTable(long symStrOffset, long symStrSize,

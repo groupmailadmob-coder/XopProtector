@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.3
+
+- Desktop / installer / packer jar / native version **0.7.3**.
+
 ## 0.7.2
 
 - Desktop / installer / packer jar / native version **0.7.2**.

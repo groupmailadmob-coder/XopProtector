@@ -451,10 +451,23 @@ public final class BusinessSoProtector {
         return isSystemSonameSkip(name) || isIndustrySkip(name);
     }
 
+    /**
+     * JNI that derives Java objects from the kernel SO path (dladdr / maps).
+     * Encrypting forces L2e/memfd and historically GetObjectField(null) on
+     * {@code /memfd:libSdkyclx_clx.so (deleted)}. Never encrypt (all modes).
+     */
+    static boolean isPathDerivedJniSkip(String name) {
+        if (name == null || name.isEmpty()) return false;
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.contains("sdkyclx") || lower.contains("yclx_clx");
+    }
+
     private static String skipReason(String name, Mode mode) {
         if (isShellLib(name)) return "shell";
         // Class S: all modes (AGGRESSIVE included) — Conscrypt / GLES collision.
         if (isSystemSonameSkip(name)) return "system_soname";
+        // Path-derived JNI (Sdkyclx/clx Helper.install): all modes.
+        if (isPathDerivedJniSkip(name)) return "path_derived_jni";
         // UniApp / DCloud Weex: all modes — IPC breaks after .text RC4.
         if (isUniAppRuntimeSkip(name)) return "uniapp/runtime";
         // Industry SDKs: SAFE/MAX only.

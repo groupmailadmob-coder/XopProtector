@@ -15,6 +15,7 @@
 
 #include <android/log.h>
 #include <android/api-level.h>
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -152,6 +153,11 @@ static void decrypt_section(const char* section_name, int temp_prot, int target_
 }
 
 void decrypt_bitcode() {
+    static std::atomic_bool done{false};
+    bool expected = false;
+    if (!done.compare_exchange_strong(expected, true)) {
+        return;
+    }
     decrypt_section(SECTION_NAME_BITCODE,
                     PROT_READ | PROT_WRITE | PROT_EXEC,
                     PROT_READ | PROT_EXEC);
@@ -175,6 +181,12 @@ static void seed_rng() {
 }
 
 void init_protector() {
+    static std::atomic_bool done{false};
+    bool expected = false;
+    if (!done.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
     seed_rng();
 #ifdef DECRYPT_BITCODE
     decrypt_bitcode();
@@ -199,18 +211,22 @@ void init_protector() {
     }
 #endif
     runtime_state().sdk_level = android_get_device_api_level();
-    // Early bytehook + dlopen hooks so business SOs loaded before initApp
-    // are queued / decrypted once sokeys arrive (see --protect-so).
+    // Install after JNI_OnLoad — never from .init_array (linker-hook + bh_cfi
+    // dlopen deadlock on some OEMs). Dobby linker hooks stay here; ART class
+    // hooks remain deferred to init_app.
     protector::hook::ensure_bytehook();
     protector::so::install_business_so_hooks();
-    // Defer ART hooks to init_app — constructor-time Dobby ELF parse can SEGV on
-    // some Android 14 / APEX libart layouts before the process is fully up.
     protector::risk::risk_checker().start();
-    PLOGI("init_protector done (ART hooks deferred; dlopen hooks early)");
+    PLOGI("init_protector done (hooks from JNI_OnLoad; ART hooks deferred)");
 }
 
 } // namespace protector
 
+// .init_array: decrypt .bitcode only. JNI_OnLoad / so_guard / hooks live in
+// that section — ART calls JNI_OnLoad after constructors, so plaintext must
+// exist first. Never install linker hooks here (OEM dlopen deadlock).
 INIT_ARRAY_SECTION void protector_early_init() {
-    protector::init_protector();
+#ifdef DECRYPT_BITCODE
+    protector::decrypt_bitcode();
+#endif
 }

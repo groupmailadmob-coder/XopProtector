@@ -2,6 +2,7 @@
 #include "common/elf_util.h"
 #include "common/log.h"
 #include "common/protector_macro.h"
+#include "common/va_tag.h"
 #include "crypto/aes.h"
 #include "crypto/rc4.h"
 #include "crypto/sha256.h"
@@ -1281,6 +1282,7 @@ static bool restore_text_pages(uintptr_t start, size_t size, const std::vector<P
 
 static bool write_via_process_vm(void* dst, const void* src, size_t size) {
 #if defined(__NR_process_vm_writev)
+    dst = untag_ptr(dst);
     struct iovec local {};
     local.iov_base = const_cast<void*>(src);
     local.iov_len = size;
@@ -1300,6 +1302,7 @@ static bool write_via_process_vm(void* dst, const void* src, size_t size) {
 
 static bool vm_read_local(void* dst, uintptr_t src, size_t n) {
     if (dst == nullptr || n == 0) return false;
+    src = strip_va_tag(src);
 #if defined(__NR_process_vm_readv)
     struct iovec local {};
     local.iov_base = dst;
@@ -1341,7 +1344,7 @@ static bool write_via_proc_mem(void* dst, const void* src, size_t size) {
                                             O_RDWR | O_CLOEXEC));
     if (fd < 0) return false;
     const auto* in = static_cast<const uint8_t*>(src);
-    const auto addr = reinterpret_cast<uintptr_t>(dst);
+    const auto addr = strip_va_tag(reinterpret_cast<uintptr_t>(dst));
     size_t done = 0;
     bool ok = true;
     while (done < size) {
@@ -1781,9 +1784,11 @@ static bool is_system_soname(const std::string& need);
 static int scrub_forbidden_from_so_plain(const std::string& out_dir);
 
 /**
- * L1/L2/L3 keyed open plan (docs/so-load-contract.md).
- * L2: linker filename = extract path (dladdr); content = memfd (optional) or
- * so_plain via LIBRARY_FD. L3 keeps the so_plain path as fallback.
+ * L1/L2e/L3 keyed open plan (docs/so-load-contract.md).
+ * Packaged extract present: map that inode and RC4 .text in RAM (L2e).
+ * memfd is not used for that case — kernel maps would show /memfd:soname
+ * (deleted) and JNI_OnLoad that trusts the path faults. L3 (so_plain path,
+ * or LIBRARY_FD only when the extract file itself is absent) is the fallback.
  */
 struct KeyedOpenPlan {
     std::string base;
@@ -2523,28 +2528,11 @@ static void install_linker_extract_hooks() {
     } else {
         PLOGW("business so: linker call_constructors symbol missing path=%s", li.path);
     }
-    // ART LoadNativeLibrary goes linker __loader_android_dlopen_ext (apex
-    // libnativeloader → libdl). bytehook_hook_all does not see that export, so
-    // keyed extract paths skip fake_android_dlopen_ext (Hi-MC libcpbase SIGILL).
-    void* loader_ext = resolve_linker_symbol(li.path, li.load_bias,
-                                             "__loader_android_dlopen_ext", nullptr);
-    if (loader_ext == nullptr) {
-        loader_ext = resolve_linker_symbol(li.path, li.load_bias,
-                                           "android_dlopen_ext", nullptr);
-    }
-    if (loader_ext != nullptr) {
-        int rc = DobbyHook(loader_ext,
-                           reinterpret_cast<dobby_dummy_func_t>(hooked_loader_android_dlopen_ext),
-                           reinterpret_cast<dobby_dummy_func_t*>(&g_orig_loader_dlopen_ext));
-        if (rc == 0) {
-            any = true;
-            xop_so_log(ANDROID_LOG_INFO,
-                       "[XOP-SO] linker __loader_android_dlopen_ext hooked");
-            PLOGI("business so: linker __loader_android_dlopen_ext hooked");
-        } else {
-            PLOGW("business so: linker android_dlopen_ext DobbyHook rc=%d", rc);
-        }
-    }
+    // Do NOT DobbyHook __loader_android_dlopen_ext. On some OEM Android 11
+    // linkers the trampoline never returns (SPRING2_PRO: Helper.install hang).
+    // bytehook covers ClassLoader / libdl PLT; L2e decrypt uses mmap +
+    // call_constructors hooks below. DT_NEEDED of keyed extract SOs still hits
+    // those inode hooks when the linker maps the file.
     if (any) {
         g_extract_inode_hooks_ok.store(true, std::memory_order_release);
         hide_extract_inode_helpers();
@@ -2706,7 +2694,7 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
         bool archived = file_exists_path(cipher)
                 || copy_file_bytes(extract, cipher, /*force=*/true);
         if (!archived) {
-            PLOGW("business so: L1 cipher archive failed %s — trying L2", base.c_str());
+            PLOGW("business so: L1 cipher archive failed %s — trying L2e", base.c_str());
         } else if (copy_file_bytes(plain_path, extract, /*force=*/true)) {
             note_extract_published(base);
             note_plain_inode(base, extract);
@@ -2730,17 +2718,20 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
             PLOGI("business so: load L1 extract plain %s", base.c_str());
             return plan;
         } else {
-            PLOGW("business so: L1 publish failed %s — trying L2", base.c_str());
+            PLOGW("business so: L1 publish failed %s — trying L2e", base.c_str());
         }
     }
-    // L2e: map the packaged extract inode (stock /data/app/.../lib path) and
-    // RC4 .text in memory before constructors. so_plain path-load keeps the
-    // kernel maps path on code_cache, which breaks Teigha static modules.
-    if (extract_inode_hooks_ok() && needs_extract_inode(base)
-            && file_exists_path(extract)) {
-        if (!file_execmod_ok()) {
+    // Packaged extract file: always map that inode and RC4 .text in RAM.
+    // Applies to every keyed SO, not only packer l2e megacores. memfd leaves
+    // kernel maps as /memfd:<soname> (deleted); a JNI_OnLoad that derives a
+    // Java object from that path then calls GetObjectField(null).
+    // needs_extract_inode stays a packer flag (eager-skip / helper hide).
+    if (!extract.empty() && file_exists_path(extract)) {
+        const bool hooks = extract_inode_hooks_ok();
+        if (!hooks || !file_execmod_ok()) {
             plan.linker_name.clear();
             plan.content_path.clear();
+            plan.use_library_fd = false;
             plan.in_memory_decrypt = false;
             {
                 std::lock_guard<std::mutex> lock(g_diag_mu);
@@ -2750,12 +2741,15 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
                 r.output.clear();
                 diag_emit(base, r);
             }
-            diag_log_dlopen(base, {}, "blocked_execmod");
-            PLOGE("business so: FATAL execmod denied, refuse L2e %s", base.c_str());
+            diag_log_dlopen(base, {}, hooks ? "blocked_execmod" : "blocked_no_hooks");
+            PLOGE("business so: FATAL %s, refuse memfd %s",
+                  hooks ? "execmod denied" : "extract-inode hooks missing",
+                  base.c_str());
             xop_so_log(ANDROID_LOG_ERROR,
-                       "[XOP-SO] FATAL name=%s execmod denied — refuse in-place "
-                       "extract .text decrypt (so_plain path would break kernel maps)",
-                       base.c_str());
+                       "[XOP-SO] FATAL name=%s %s — refuse memfd "
+                       "(kernel maps must stay on packaged extract)",
+                       base.c_str(),
+                       hooks ? "execmod denied" : "extract-inode hooks missing");
             return plan;
         }
         pin_plain_needed_for_extract(extract);
@@ -2791,11 +2785,9 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
             (void)plant_hardlink_or_copy(plain_path, mirror_so);
         }
     }
-    // Opportunistic extract map (hooks ok, so_plain not ready, not l2e=true).
-    // path_for_dlopen only returns this path after the file-backed execmod probe.
-    // Mark in-memory so a failed .text write dlcloses instead of reaching JNI_OnLoad.
-    // needs_extract_inode stays off this branch: those SOs are L2e or FATAL above,
-    // and must not use LIBRARY_FD (Teigha .rela.dyn).
+    // Reached only when the packaged extract file is absent (L2e returned above
+    // whenever that inode exists). LIBRARY_FD here cannot show the stock maps
+    // path; it is the no-extract fallback, not the default keyed load.
     const bool extract_cipher = plain_path == extract && !extract.empty()
             && extract_inode_hooks_ok()
             && !extract_holds_plaintext(base, extract);
@@ -2874,14 +2866,31 @@ static AndroidDlopenExtFn resolve_android_dlopen_ext();
 static void* invoke_android_dlopen_ext(const char* name, int flags,
                                        const android_dlextinfo* info,
                                        const void* loader_caller) {
-    // Saved Dobby trampoline. dlsym(__loader_android_dlopen_ext) returns the
-    // hooked entry and would re-enter hooked_loader_android_dlopen_ext.
-    if (g_orig_loader_dlopen_ext != nullptr) {
-        return g_orig_loader_dlopen_ext(name, flags, info, loader_caller);
+    (void)loader_caller;
+    // Prefer libc android_dlopen_ext / dlopen under re-entry guards. Calling the
+    // Dobby-saved __loader_android_dlopen_ext trampoline from inside a bytehook
+    // stub has been observed to never return on some OEM Android 11 devices
+    // (SPRING2_PRO: Helper.install → libSdkyclx_clx.so splash hang). L2e still
+    // relies on linker mmap / call_constructors hooks, not this trampoline.
+    ++g_in_keyed_plan_fallback;
+    void* h = nullptr;
+    if (info != nullptr) {
+        using Ext3Fn = void* (*)(const char*, int, const android_dlextinfo*);
+        Ext3Fn ext = reinterpret_cast<Ext3Fn>(
+                dlsym(RTLD_NEXT, "android_dlopen_ext"));
+        if (ext == nullptr) {
+            ext = reinterpret_cast<Ext3Fn>(
+                    dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+        }
+        if (ext != nullptr) {
+            h = ext(name, flags, info);
+        }
     }
-    AndroidDlopenExtFn ext = resolve_android_dlopen_ext();
-    if (ext == nullptr) return nullptr;
-    return ext(name, flags, info);
+    if (h == nullptr) {
+        h = dlopen(name, flags);
+    }
+    --g_in_keyed_plan_fallback;
+    return h;
 }
 
 static void* dlopen_fallback_path(const char* path, int flags) {
@@ -4999,12 +5008,10 @@ static std::string path_for_dlopen(const char* filename) {
 
     if (extract_inode_hooks_ok()) {
         std::string nld;
-        std::string cache_root;
         bool keyed = false;
         {
             std::lock_guard<std::mutex> lock(g_mu);
             nld = g_native_lib_dir;
-            cache_root = g_protector_dir;
             keyed = find_key_unlocked(base) != nullptr;
         }
         if (!keyed) {
@@ -5012,46 +5019,28 @@ static std::string path_for_dlopen(const char* filename) {
         }
         std::string extract = nld.empty() ? std::string() : (nld + "/" + base);
         const bool class_b = needs_extract_inode(base);
-        std::string cache = cache_root.empty()
-                ? std::string() : (cache_root + "/so_plain/" + base);
-        if (!class_b && !cache.empty() && file_exists_path(cache)) {
-            // Plaintext content for plan_keyed_open. The plan opens it via
-            // memfd / LIBRARY_FD; this return is not a path-load name.
-            hide_extract_inode_helpers();
-            diag_log_dlopen(base, cache, "so_plain_warm");
-            return cache;
-        }
+        // so_plain warm must not steal the load. A ready mirror used to return
+        // here and plan_keyed_open then memfd'd it, so maps showed
+        // /memfd:<soname> (deleted) even when execmod could map extract.
         if (!extract.empty() && file_exists_path(extract)) {
             if (!file_execmod_ok()) {
-                if (class_b) {
-                    PLOGE("business so: FATAL execmod denied, refuse L2e dlopen %s",
-                          base.c_str());
-                    xop_so_log(ANDROID_LOG_ERROR,
-                               "[XOP-SO] FATAL name=%s execmod denied — refuse l2e "
-                               "extract load",
-                               base.c_str());
-                    diag_log_dlopen(base, {}, "blocked_execmod");
-                    return {};
-                }
-                // Do not map extract ciphertext. plan_keyed_open still opens
-                // the materialized so_plain via memfd / USE_LIBRARY_FD.
-                PLOGW("business so: execmod denied, skip opportunistic L2e %s "
-                      "— materialize so_plain",
+                PLOGE("business so: FATAL execmod denied, refuse L2e dlopen %s",
                       base.c_str());
-                xop_so_log(ANDROID_LOG_WARN,
-                           "[XOP-SO] name=%s execmod denied, opportunistic L2e "
-                           "skipped (so_plain via fd)",
+                xop_so_log(ANDROID_LOG_ERROR,
+                           "[XOP-SO] FATAL name=%s execmod denied — refuse l2e "
+                           "extract load",
                            base.c_str());
-            } else {
-                hide_extract_inode_helpers();
-                pin_plain_needed_for_extract(extract);
-                diag_log_dlopen(base, extract, class_b ? "l2e_extract" : "l2e_ondemand");
-                return extract;
+                diag_log_dlopen(base, {}, "blocked_execmod");
+                return {};
             }
+            hide_extract_inode_helpers();
+            pin_plain_needed_for_extract(extract);
+            diag_log_dlopen(base, extract, class_b ? "l2e_extract" : "l2e_ondemand");
+            return extract;
         }
     }
 
-    // Hooks missing, or opportunistic L2e refused because execmod failed.
+    // Hooks missing, or no packaged extract file.
     // Materialize keyed self + DT_NEEDED onto so_plain.
     ensure_plain_closure_for(base);
 
@@ -5205,7 +5194,8 @@ static void* hooked_loader_android_dlopen_ext(const char* filename, int flags,
     if (g_orig_loader_dlopen_ext == nullptr) {
         return nullptr;
     }
-    if (g_in_loader_dlopen > 0 || filename == nullptr || filename[0] == '\0') {
+    if (g_in_loader_dlopen > 0 || g_in_keyed_plan_fallback > 0
+            || filename == nullptr || filename[0] == '\0') {
         return g_orig_loader_dlopen_ext(filename, flags, extinfo, caller);
     }
     ++g_in_loader_dlopen;
@@ -5289,6 +5279,9 @@ static void* fake_dlopen(const char* filename, int flags) {
 
 static void* fake_android_dlopen_ext(const char* filename, int flags, const void* extinfo) {
     BYTEHOOK_STACK_SCOPE();
+    if (g_in_keyed_plan_fallback > 0) {
+        return BYTEHOOK_CALL_PREV(fake_android_dlopen_ext, filename, flags, extinfo);
+    }
     std::string path = path_for_dlopen(filename);
     if (path.empty()) {
         if (filename != nullptr && filename[0] != '\0'
@@ -5529,8 +5522,13 @@ static std::string rewrite_maps_line(const std::string& line_in) {
     if (name_end <= slash + 1) return line_in;
     const size_t name_len = name_end - (slash + 1);
     if (name_len < 4 || name_len >= 256) return line_in;
-    const std::string base = line_in.substr(slash + 1, name_len);
-    if (!is_keyed_basename(base)) return line_in;
+    std::string base = line_in.substr(slash + 1, name_len);
+    // maps pathname is "/memfd:libX.so (deleted)". rfind('/') yields
+    // "memfd:libX.so", which is not the keyed basename.
+    if (from_memfd && base.compare(0, 6, "memfd:") == 0) {
+        base.erase(0, 6);
+    }
+    if (base.size() < 4 || !is_keyed_basename(base)) return line_in;
     const std::string extract = extract_path_for_keyed(base);
     if (extract.empty()) return line_in;
 

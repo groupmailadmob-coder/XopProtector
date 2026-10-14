@@ -42,11 +42,19 @@ static void *bh_cfi_slowpath = NULL;
 static void *bh_cfi_slowpath_diag = NULL;
 
 __attribute__((constructor)) static void bh_cfi_ctor(void) {
-  void *handle = dlopen(BH_CFI_LIB_DL, RTLD_NOW);
-  if (NULL != handle) {
-    bh_cfi_slowpath = dlsym(handle, BH_CFI_SLOWPATH);
-    bh_cfi_slowpath_diag = dlsym(handle, BH_CFI_SLOWPATH_DIAG);
-    dlclose(handle);
+  // Prefer RTLD_DEFAULT — dlopen("libdl.so") from .init_array can deadlock
+  // with bionic's loader lock on some OEM devices when the hosting SO is
+  // still inside call_constructors (and especially after linker hooks).
+  bh_cfi_slowpath = dlsym(RTLD_DEFAULT, BH_CFI_SLOWPATH);
+  bh_cfi_slowpath_diag = dlsym(RTLD_DEFAULT, BH_CFI_SLOWPATH_DIAG);
+  if (NULL == bh_cfi_slowpath || NULL == bh_cfi_slowpath_diag) {
+    void *handle = dlopen(BH_CFI_LIB_DL, RTLD_NOW);
+    if (NULL != handle) {
+      if (NULL == bh_cfi_slowpath) bh_cfi_slowpath = dlsym(handle, BH_CFI_SLOWPATH);
+      if (NULL == bh_cfi_slowpath_diag)
+        bh_cfi_slowpath_diag = dlsym(handle, BH_CFI_SLOWPATH_DIAG);
+      dlclose(handle);
+    }
   }
 }
 

@@ -7,6 +7,7 @@
 #include "common/obfuscate.h"
 #include "common/runtime_state.h"
 #include "common/protector_macro.h"
+#include "common/va_tag.h"
 #include "vm/pvm2_interp.h"
 
 #include <atomic>
@@ -454,6 +455,7 @@ static bool frida_tmp_files() {
  */
 static bool safe_read_u32(const void* addr, uint32_t* out) {
     if (addr == nullptr || out == nullptr) return false;
+    addr = untag_ptr(addr);
 #if defined(__ANDROID__)
     struct iovec local{out, sizeof(uint32_t)};
     struct iovec remote{const_cast<void*>(addr), sizeof(uint32_t)};
@@ -693,8 +695,8 @@ static void verify_libc_text_crc() {
     uint32_t crc_mem = 0;
     size_t remaining = shdr.sh_size;
     size_t offset = 0;
-    const auto* mem_base =
-            reinterpret_cast<const uint8_t*>(info.dli_fbase) + shdr.sh_addr;
+    const auto* mem_base = untag_ptr(
+            reinterpret_cast<const uint8_t*>(info.dli_fbase) + shdr.sh_addr);
     // Android 10+ XOM: cannot load from .text; process_vm_readv into a scratch page.
     constexpr size_t kChunk = 4096;
     uint8_t scratch[kChunk];
