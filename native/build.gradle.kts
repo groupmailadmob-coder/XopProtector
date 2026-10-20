@@ -83,10 +83,10 @@ android {
 dependencies {
     implementation("androidx.annotation:annotation:1.7.1")
     // Required by bytehook on arm/arm64 (dl init/fini monitor). x86/x86_64 skip it.
-    implementation("com.bytedance.android:shadowhook:1.1.1")
+    implementation("com.bytedance.android:shadowhook:2.0.1")
 }
 
-// Prefab shadowhook 1.1.1 has no x86/x86_64 modules; AGP still resolves it for every ABI.
+// Shadowhook has no x86/x86_64 modules; AGP still resolves it for every ABI.
 fun plantShadowhookPrefabBypass() {
     val abis = listOf("x86", "x86_64")
     fun plantInLibs(libsDir: File) {
