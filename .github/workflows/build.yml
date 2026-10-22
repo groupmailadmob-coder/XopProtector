@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'corretto'
+
+      - name: Build packer
+        run: ./gradlew :packer:shadowJar -x :demo:assemble -x :engine:build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer
+          path: packer/build/libs/packer-all.jar
